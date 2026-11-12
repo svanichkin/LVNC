@@ -1,0 +1,9 @@
+build/
+target/
+compile_commands.json
+.DS_Store
+.build/
+.swiftpm/
+scripts/local.env
+*.p12
+*.p8

@@ -1,0 +1,64 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:LVNC}",
+            "name": "Debug lvnc-viewer",
+            "target": "lvnc-viewer",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug lvnc-viewer"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:LVNC}",
+            "name": "Release lvnc-viewer",
+            "target": "lvnc-viewer",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release lvnc-viewer"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:LVNC}",
+            "name": "Debug lvnc-agent",
+            "target": "lvnc-agent",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug lvnc-agent"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:LVNC}",
+            "name": "Release lvnc-agent",
+            "target": "lvnc-agent",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release lvnc-agent"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:LVNC}",
+            "name": "Debug lvnc-audio-probe",
+            "target": "lvnc-audio-probe",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug lvnc-audio-probe"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:LVNC}",
+            "name": "Release lvnc-audio-probe",
+            "target": "lvnc-audio-probe",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release lvnc-audio-probe"
+        }
+    ]
+}

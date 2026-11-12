@@ -1,0 +1,122 @@
+name: Release
+
+# Push a tag like v0.7.1 (it must match lvncVersion in Sources/LVNCCore/Wire.swift).
+#
+# Signing and notarization are optional and come only from repository secrets; nothing
+# identifying is written to the log. Without the secrets the release is signed ad-hoc.
+#
+#   DEVELOPER_ID_P12           base64 of the exported "Developer ID Application" certificate + key (.p12)
+#   DEVELOPER_ID_P12_PASSWORD  password of that .p12
+#   NOTARY_KEY                 base64 of an App Store Connect API key (.p8)
+#   NOTARY_KEY_ID              its key ID
+#   NOTARY_ISSUER_ID           its issuer ID
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    env:
+      HAS_CERT: ${{ secrets.DEVELOPER_ID_P12 != '' }}
+      HAS_NOTARY: ${{ secrets.NOTARY_KEY != '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Check that the tag matches the version
+        run: |
+          VERSION="$(sed -n 's/^public let lvncVersion = "\(.*\)"/\1/p' Sources/LVNCCore/Wire.swift)"
+          if [ "v$VERSION" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match lvncVersion $VERSION"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Test
+        run: swift test
+
+      - name: Import the signing certificate
+        if: env.HAS_CERT == 'true'
+        env:
+          P12: ${{ secrets.DEVELOPER_ID_P12 }}
+          P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -hex 24)"
+          echo "::add-mask::$KEYCHAIN_PASSWORD"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -P "$P12_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN" > /dev/null
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN" > /dev/null
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          # Use the SHA-1, so the certificate's name (the developer's) never reaches the log.
+          IDENTITY="$(security find-identity -v -p codesigning "$KEYCHAIN" | awk '/Developer ID Application/ { print $2; exit }')"
+          if [ -z "$IDENTITY" ]; then echo "::error::no Developer ID Application identity in the .p12"; exit 1; fi
+          echo "::add-mask::$IDENTITY"
+          echo "LVNC_SIGN_IDENTITY=$IDENTITY" >> "$GITHUB_ENV"
+          echo "LVNC_HARDENED=1" >> "$GITHUB_ENV"
+
+      - name: Build and sign the apps
+        env:
+          LVNC_UNIVERSAL: '1'
+        run: scripts/bundle.sh dist
+
+      - name: Notarize and staple
+        if: env.HAS_CERT == 'true' && env.HAS_NOTARY == 'true'
+        env:
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.NOTARY_ISSUER_ID }}
+        run: |
+          echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/notary.p8"
+          ditto -c -k --keepParent dist "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" \
+            --key "$RUNNER_TEMP/notary.p8" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+            --wait --timeout 30m --output-format json > "$RUNNER_TEMP/notary.json"
+          rm -f "$RUNNER_TEMP/notary.p8"
+          STATUS="$(plutil -extract status raw "$RUNNER_TEMP/notary.json")"
+          echo "notarization: $STATUS"
+          if [ "$STATUS" != "Accepted" ]; then echo "::error::notarization $STATUS"; exit 1; fi
+          for app in "LVNC" "LVNC Agent"; do xcrun stapler staple "dist/$app.app" > /dev/null; done
+          echo "NOTARIZED=1" >> "$GITHUB_ENV"
+
+      - name: Package
+        run: |
+          PKG="LVNC-$VERSION"
+          mkdir "$PKG"
+          ditto "dist/LVNC.app" "$PKG/LVNC.app"
+          ditto "dist/LVNC Agent.app" "$PKG/LVNC Agent.app"
+          ditto -c -k --keepParent "$PKG" "$PKG.zip"
+          shasum -a 256 "$PKG.zip" > "$PKG.zip.sha256"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${NOTARIZED:-0}" = 1 ]; then
+            SIGNED="Signed with a Developer ID and notarized by Apple."
+          elif [ "$HAS_CERT" = true ]; then
+            SIGNED="Signed with a Developer ID, **not notarized**: on first launch, right-click the app and choose Open."
+          else
+            SIGNED="Signed **ad-hoc**: on first launch, right-click the app and choose Open. Privacy permissions have to be granted again after each update."
+          fi
+          cat > notes.md <<NOTES
+          $SIGNED
+
+          **Install:** unzip, move \`LVNC.app\` and \`LVNC Agent.app\` to \`/Applications\`, then follow
+          [Install → step 2](https://github.com/$GITHUB_REPOSITORY#2-set-up-the-agent-once-in-the-target-session)
+          in the target user's session. Universal (Apple silicon and Intel), macOS 14 or later.
+          NOTES
+          gh release create "$GITHUB_REF_NAME" "LVNC-$VERSION.zip" "LVNC-$VERSION.zip.sha256" \
+            --title "LVNC $VERSION" --notes-file notes.md --generate-notes --verify-tag
