@@ -44,6 +44,7 @@ Requires macOS 14 or later. Built and used on macOS 27 on Apple silicon.
 | `/Users/Shared/lvnc/logs/agent-<target>.log` | Agent log. | agent |
 | `/Users/Shared/lvnc/logs/viewer-<controller>.log` | Viewer log (when started from the Dock/Finder). | viewer |
 | `$TMPDIR/LVNC-clipboard/` (each user) | Files received through the clipboard (last few copies). | each side |
+| `$TMPDIR/LVNC-drop/` (target user) | Files dragged into the viewer window (last few drags). | agent |
 
 Both apps live in `/Applications` so both users can run them, and the controller (an
 admin) can update them without touching the target's home folder.
@@ -202,6 +203,23 @@ Both sides poll the pasteboard's change count every 0.5 s and send changes to th
   ([nspasteboard.org](http://nspasteboard.org) types) never leave the session;
 - the same content is never sent twice, and received content is not echoed back.
 
+### Drag and drop
+
+Files and folders dragged from the controller session into the viewer window land in the
+target session wherever they are dropped (a Finder folder, the Desktop, a chat, a mail):
+
+- when the drag enters the window, the viewer passes the files by descriptor, as for the
+  clipboard; the agent clones them into `$TMPDIR/LVNC-drop/…`;
+- only an app can start a drag, from a mouse-down in its own window. So the agent (an
+  `NSApplication` with no Dock icon) puts a tiny, invisible panel under the entry point,
+  posts a mouse-down onto it and starts a real dragging session with the file URLs;
+- the viewer's drag movements are posted as mouse drags and the drop as a mouse-up, so
+  the target app highlights and accepts the drop as usual (copy, never move);
+- leaving the window or pressing Esc releases the drag over the agent's own panel,
+  which accepts nothing, and the received copy is deleted.
+
+Only the controller → target direction is supported.
+
 ### Updates without restarts
 
 Both apps watch their own executable. When `scripts/install.sh` replaces it:
@@ -331,7 +349,8 @@ even through an SSH tunnel.
 - **⌘Tab** and other system-level shortcuts stay with the controller's session.
 - **One viewer at a time:** a new connection replaces the previous one.
 - **One display:** the agent captures the target's main display.
-- **Clipboard folders** with more than 128 files are not sent; symlinks inside copied
-  folders are skipped.
+- **Clipboard and drag folders** with more than 128 files are not sent; symlinks inside
+  copied folders are skipped.
+- **Drag and drop** works only from the controller into the target, not back out.
 - **Full screen** on a Mac with a camera notch: macOS places the window below the notch,
   so the image is slightly smaller than the display and the sides show the hazard stripes.

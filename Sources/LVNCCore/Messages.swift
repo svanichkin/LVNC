@@ -151,6 +151,16 @@ public struct ClipboardMsg {
     }
 }
 
+/// Viewer -> agent: files dragged into the viewer window, at (x, y) normalized like `MouseMsg`.
+/// The agent starts a drag with them at that point; `.mouse(.drag)` moves it, `.mouse(.up)`
+/// drops it, `.dragCancel` abandons it. `files` carries descriptors as in a clipboard message.
+public struct DragMsg {
+    public var x: Double
+    public var y: Double
+    public var files: ClipboardMsg
+    public init(x: Double, y: Double, files: ClipboardMsg) { self.x = x; self.y = y; self.files = files }
+}
+
 /// Viewer -> agent: how much the viewer needs right now. The agent captures accordingly.
 public enum ViewerActivity: UInt8 {
     case active = 0      // window focused: full frame rate
@@ -187,9 +197,12 @@ public enum Message {
     /// Viewer -> agent: refresh rate of the screen the window is on (frames per second);
     /// the agent captures no faster than that.
     case displayRate(UInt32)
+    case dragBegin(DragMsg)
+    case dragCancel
 
     enum Kind: UInt32 {
         case hello = 1, frame, release, mouse, scroll, key, clipboard, activity, inputSource, cursor, displayRate
+        case dragBegin, dragCancel
     }
 
     var kind: Kind {
@@ -205,13 +218,18 @@ public enum Message {
         case .inputSource: return .inputSource
         case .cursor: return .cursor
         case .displayRate: return .displayRate
+        case .dragBegin: return .dragBegin
+        case .dragCancel: return .dragCancel
         }
     }
 
     /// Descriptors to pass along with this message.
     var attachedFDs: [Int32] {
-        if case .clipboard(let c) = self { return c.fds }
-        return []
+        switch self {
+        case .clipboard(let c): return c.fds
+        case .dragBegin(let d): return d.files.fds
+        default: return []
+        }
     }
 
     func payload() -> [UInt8] {
@@ -234,18 +252,7 @@ public enum Message {
         case .key(let k):
             w.u16(k.keyCode); w.u8(k.down ? 1 : 0); w.u8(k.isRepeat ? 1 : 0); w.u64(k.flags)
         case .clipboard(let c):
-            w.u32(UInt32(c.items.count))
-            for item in c.items {
-                let type = Array(item.type.utf8.prefix(1024))
-                w.u16(UInt16(type.count)); w.bytes(type)
-                w.u32(UInt32(item.data.count)); w.bytes(item.data)
-            }
-            w.u32(UInt32(c.files.count))
-            for f in c.files {
-                let path = Array(f.path.utf8.prefix(4096))
-                w.u16(UInt16(path.count)); w.bytes(path)
-                w.u8(f.isDirectory ? 1 : 0); w.u64(f.size)
-            }
+            Self.encode(c, into: &w)
         case .activity(let a):
             w.u8(a.rawValue)
         case .inputSource(let id):
@@ -256,6 +263,11 @@ public enum Message {
             w.u32(UInt32(c.png.count)); w.bytes(c.png)
         case .displayRate(let fps):
             w.u32(fps)
+        case .dragBegin(let d):
+            w.f64(d.x); w.f64(d.y)
+            Self.encode(d.files, into: &w)
+        case .dragCancel:
+            break
         }
         return w.bytes
     }
@@ -296,23 +308,7 @@ public enum Message {
             let code = try r.u16(), down = try r.u8(), rep = try r.u8(), flags = try r.u64()
             return .key(KeyMsg(keyCode: code, down: down != 0, isRepeat: rep != 0, flags: flags))
         case .clipboard:
-            let n = try r.u32()
-            guard n <= 64 else { throw WireError.protocolError("too many clipboard types") }
-            var items: [ClipboardMsg.Item] = []
-            for _ in 0 ..< n {
-                let type = String(decoding: try r.bytes(Int(try r.u16())), as: UTF8.self)
-                let data = try r.bytes(Int(try r.u32()))
-                items.append(ClipboardMsg.Item(type: type, data: data))
-            }
-            let nf = try r.u32()
-            guard nf <= 10_000 else { throw WireError.protocolError("too many clipboard files") }
-            var files: [ClipboardMsg.FileEntry] = []
-            for _ in 0 ..< nf {
-                let path = String(decoding: try r.bytes(Int(try r.u16())), as: UTF8.self)
-                let isDir = try r.u8() != 0
-                files.append(ClipboardMsg.FileEntry(path: path, isDirectory: isDir, size: try r.u64()))
-            }
-            return .clipboard(ClipboardMsg(items: items, files: files))
+            return .clipboard(try decodeClipboard(&r))
         case .activity:
             guard let a = ViewerActivity(rawValue: try r.u8()) else { return nil }
             return .activity(a)
@@ -323,6 +319,47 @@ public enum Message {
             return .cursor(CursorMsg(png: try r.bytes(Int(try r.u32())), width: w, height: h, hotX: hx, hotY: hy))
         case .displayRate:
             return .displayRate(try r.u32())
+        case .dragBegin:
+            let x = try r.f64(), y = try r.f64()
+            return .dragBegin(DragMsg(x: x, y: y, files: try decodeClipboard(&r)))
+        case .dragCancel:
+            return .dragCancel
         }
+    }
+
+    private static func encode(_ c: ClipboardMsg, into w: inout WireWriter) {
+        w.u32(UInt32(c.items.count))
+        for item in c.items {
+            let type = Array(item.type.utf8.prefix(1024))
+            w.u16(UInt16(type.count)); w.bytes(type)
+            w.u32(UInt32(item.data.count)); w.bytes(item.data)
+        }
+        w.u32(UInt32(c.files.count))
+        for f in c.files {
+            let path = Array(f.path.utf8.prefix(4096))
+            w.u16(UInt16(path.count)); w.bytes(path)
+            w.u8(f.isDirectory ? 1 : 0); w.u64(f.size)
+        }
+    }
+
+    /// Without descriptors: the connection attaches them.
+    private static func decodeClipboard(_ r: inout WireReader) throws -> ClipboardMsg {
+        let n = try r.u32()
+        guard n <= 64 else { throw WireError.protocolError("too many clipboard types") }
+        var items: [ClipboardMsg.Item] = []
+        for _ in 0 ..< n {
+            let type = String(decoding: try r.bytes(Int(try r.u16())), as: UTF8.self)
+            let data = try r.bytes(Int(try r.u32()))
+            items.append(ClipboardMsg.Item(type: type, data: data))
+        }
+        let nf = try r.u32()
+        guard nf <= 10_000 else { throw WireError.protocolError("too many clipboard files") }
+        var files: [ClipboardMsg.FileEntry] = []
+        for _ in 0 ..< nf {
+            let path = String(decoding: try r.bytes(Int(try r.u16())), as: UTF8.self)
+            let isDir = try r.u8() != 0
+            files.append(ClipboardMsg.FileEntry(path: path, isDirectory: isDir, size: try r.u64()))
+        }
+        return ClipboardMsg(items: items, files: files)
     }
 }

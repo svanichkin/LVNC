@@ -15,6 +15,9 @@ final class InputInjector {
     private var heldButtons = Set<UInt8>()
     private var lastPoint = CGPoint.zero
     private var scrollRemainder = (x: 0.0, y: 0.0)
+    private var dragOrigin: CGPoint?  // a drag of the viewer's files is in progress
+    private var dragFailed = false    // it did not start: ignore the viewer's drag events until it lets go
+    private let drags = DragSource()
 
     /// Virtual key codes of modifier keys; they are posted as flagsChanged events.
     private static let modifierKeys: Set<UInt16> = [54, 55, 56, 57, 58, 59, 60, 61, 62, 63]
@@ -30,6 +33,8 @@ final class InputInjector {
             case .mouse(let m): self.mouse(m)
             case .scroll(let s): self.scroll(s)
             case .key(let k): self.key(k)
+            case .dragBegin(let d): self.beginDrag(d)
+            case .dragCancel: self.cancelDrag()
             default: break
             }
         }
@@ -38,6 +43,7 @@ final class InputInjector {
     /// Release everything the viewer left pressed (it disconnected or lost focus).
     func releaseAll() {
         queue.async {
+            self.cancelDrag() // a mouse-up elsewhere would drop the files there
             for code in self.heldKeys {
                 self.key(KeyMsg(keyCode: code, down: false, isRepeat: false, flags: 0))
             }
@@ -56,14 +62,60 @@ final class InputInjector {
     }
 
     private func mouse(_ m: MouseMsg) {
+        if dragFailed, m.button == 0, m.action == .drag || m.action == .up {
+            if m.action == .up { dragFailed = false }
+            return
+        }
+        dragFailed = false
         let p = point(m)
         lastPoint = p
         switch m.action {
         case .down: heldButtons.insert(m.button)
-        case .up: heldButtons.remove(m.button)
+        case .up:
+            heldButtons.remove(m.button)
+            if m.button == 0, dragOrigin != nil {
+                dragOrigin = nil
+                lvncLog("agent", "drag: dropping")
+            }
         default: break
         }
         postMouse(action: m.action, button: m.button, clickCount: m.clickCount, at: p)
+    }
+
+    /// Files dragged into the viewer: start a drag with them here (see `DragSource`).
+    /// The following `.mouse(.drag)` messages move it, `.mouse(.up)` drops it.
+    private func beginDrag(_ d: DragMsg) {
+        cancelDrag()
+        guard enabled else { d.files.closeFDs(); return }
+        let p = point(MouseMsg(action: .down, button: 0, clickCount: 1, x: d.x, y: d.y))
+        guard drags.prepare(d.files, at: p) else { return }
+        dragOrigin = p
+        lastPoint = p
+        heldButtons.insert(0)
+        postMouse(action: .move, button: 0, clickCount: 0, at: p)
+        postMouse(action: .down, button: 0, clickCount: 1, at: p)
+        guard drags.waitForStart() else {
+            // The mouse-down went to whatever is under the panel: finish that click right
+            // there, so the viewer's drag does not drag things around in that app.
+            postMouse(action: .up, button: 0, clickCount: 1, at: p)
+            heldButtons.remove(0)
+            dragOrigin = nil
+            dragFailed = true
+            lvncLog("agent", "drag: the mouse-down did not reach the drag panel, drag not started")
+            return
+        }
+    }
+
+    /// Release the drag over its own panel, which accepts nothing.
+    private func cancelDrag() {
+        dragFailed = false
+        guard let origin = dragOrigin else { return }
+        dragOrigin = nil
+        heldButtons.remove(0)
+        lastPoint = origin
+        postMouse(action: .drag, button: 0, clickCount: 0, at: origin)
+        postMouse(action: .up, button: 0, clickCount: 1, at: origin)
+        lvncLog("agent", "drag: cancelling")
     }
 
     private func postMouse(action: MouseAction, button: UInt8, clickCount: UInt8, at p: CGPoint) {

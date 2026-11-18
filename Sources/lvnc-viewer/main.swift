@@ -221,6 +221,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         guard let window, !NSApp.isHidden, !window.isMiniaturized, window.occlusionState.contains(.visible) else {
             return .hidden
         }
+        // Dragging files in from another app: we are not active, but the user watches closely.
+        if view?.isDraggingIn == true { return .active }
         return NSApp.isActive && window.isKeyWindow ? .active : .background
     }
 
@@ -277,6 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         window.makeFirstResponder(view)
         self.view = view
         self.window = window
+        view.onDraggingChanged = { [weak self] in self?.updateActivity() }
         observeActivity()
 
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp, .flagsChanged]) { [weak self] event in

@@ -45,7 +45,7 @@ public final class Connection {
         if rc != 0 { throw WireError.io(errno) }
     }
 
-    /// Next known message. A clipboard message comes with its descriptors (caller owns them).
+    /// Next known message. Clipboard and drag messages come with their descriptors (caller owns them).
     public func receive() throws -> Message {
         while true {
             var r = WireReader(try readExactly(8))
@@ -55,17 +55,26 @@ public final class Connection {
             let payload = length > 0 ? try readExactly(length) : []
             guard let message = try Message.decode(kind: kind, payload: payload) else { continue }
 
-            if case .clipboard(var c) = message {
-                let need = c.fileFDCount
-                guard pendingFDs.count >= need else {
-                    throw WireError.protocolError("clipboard lists \(need) files but \(pendingFDs.count) descriptors arrived")
-                }
-                c.fds = Array(pendingFDs.prefix(need))
-                pendingFDs.removeFirst(need)
+            switch message {
+            case .clipboard(var c):
+                try attachFDs(to: &c)
                 return .clipboard(c)
+            case .dragBegin(var d):
+                try attachFDs(to: &d.files)
+                return .dragBegin(d)
+            default:
+                return message
             }
-            return message
         }
+    }
+
+    private func attachFDs(to c: inout ClipboardMsg) throws {
+        let need = c.fileFDCount
+        guard pendingFDs.count >= need else {
+            throw WireError.protocolError("message lists \(need) files but \(pendingFDs.count) descriptors arrived")
+        }
+        c.fds = Array(pendingFDs.prefix(need))
+        pendingFDs.removeFirst(need)
     }
 
     /// Unblocks a pending receive() on another thread, then releases the fd.

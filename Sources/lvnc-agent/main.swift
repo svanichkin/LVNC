@@ -1,3 +1,4 @@
+import AppKit
 import ApplicationServices
 import CLVNC
 import CoreGraphics
@@ -296,7 +297,7 @@ final class Agent {
                 let message = try conn.receive()
                 switch message {
                 case .release(let buffer): publisher.release(buffer)
-                case .mouse, .scroll, .key: injector.handle(message)
+                case .mouse, .scroll, .key, .dragBegin, .dragCancel: injector.handle(message)
                 case .clipboard(let c): if options.noClipboard { c.closeFDs() } else { clipboard.apply(c) }
                 case .activity(let a): setActivity(a, for: conn)
                 case .displayRate(let fps): setDisplayRate(fps, for: conn)
@@ -350,4 +351,7 @@ do {
     lvncLog("agent", "fatal: \(error)")
     exit(1)
 }
-dispatchMain()
+// An app run loop rather than dispatchMain(): drag and drop needs a window (DragSource).
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+app.run()

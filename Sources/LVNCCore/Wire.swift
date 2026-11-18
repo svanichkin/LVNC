@@ -1,7 +1,7 @@
 import Foundation
 
-public let lvncVersion = "0.7.1"
-public let lvncProtocolVersion: UInt32 = 2
+public let lvncVersion = "0.8.0"
+public let lvncProtocolVersion: UInt32 = 3
 
 /// First bytes on a fresh connection, sent by the agent together with the shared memory fd.
 public let lvncMagic: [UInt8] = Array("LVNC".utf8)

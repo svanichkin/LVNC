@@ -61,6 +61,36 @@ final class ConnectionTests: XCTestCase {
         guard case .release(2) = try b.receive() else { return XCTFail() }
     }
 
+    func testDragCarriesFilesAndDescriptors() throws {
+        let (a, b) = pair()
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try Data("перетащили".utf8).write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+        let fd = open(file.path, O_RDONLY)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+
+        let files = ClipboardMsg(items: [], files: [.init(path: "Папка", isDirectory: true, size: 0),
+                                                    .init(path: "Папка/f.txt", isDirectory: false, size: 20)], fds: [fd])
+        try a.send(.dragBegin(DragMsg(x: 0.25, y: 0.5, files: files)))
+        close(fd)
+        try a.send(.mouse(MouseMsg(action: .up, button: 0, clickCount: 1, x: 0.75, y: 0.5)))
+        try a.send(.dragCancel)
+
+        guard case .dragBegin(let d) = try b.receive() else { return XCTFail() }
+        XCTAssertEqual(d.x, 0.25); XCTAssertEqual(d.y, 0.5)
+        XCTAssertEqual(d.files.files.map(\.path), ["Папка", "Папка/f.txt"])
+        XCTAssertEqual(d.files.fds.count, 1)
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let tops = try FileTransfer.materialize(d.files, under: root, keep: 1)
+        d.files.closeFDs()
+        XCTAssertEqual(tops.map(\.lastPathComponent), ["Папка"])
+        XCTAssertEqual(try String(contentsOf: tops[0].appendingPathComponent("f.txt"), encoding: .utf8), "перетащили")
+        guard case .mouse(let m) = try b.receive() else { return XCTFail() }
+        XCTAssertEqual(m.action, .up)
+        guard case .dragCancel = try b.receive() else { return XCTFail() }
+    }
+
     func testCursorRoundTrip() throws {
         let (a, b) = pair()
         try a.send(.cursor(CursorMsg(png: [1, 2, 3], width: 23, height: 22, hotX: 11.5, hotY: 11)))

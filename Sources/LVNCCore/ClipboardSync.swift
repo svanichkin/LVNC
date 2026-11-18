@@ -1,5 +1,4 @@
 import AppKit
-import CLVNC
 import UniformTypeIdentifiers
 
 /// Mirrors the general pasteboard to the peer and applies the peer's changes.
@@ -8,9 +7,8 @@ import UniformTypeIdentifiers
 /// changed. After applying a remote change it remembers the resulting changeCount and a
 /// fingerprint of the content, so nothing bounces back or is sent twice.
 ///
-/// Copied files and folders (Finder) are not read: the sender opens them and passes the
-/// descriptors; the receiver clones them (APFS, instant) into its own temporary folder and
-/// puts file URLs on its pasteboard. No size limit, nothing large goes through the socket.
+/// Copied files and folders (Finder) go by descriptor (see `FileTransfer`); the receiver
+/// puts file URLs of its clones on its pasteboard.
 public final class ClipboardSync {
     /// Representations we carry, in the order they are written back.
     static let types: [NSPasteboard.PasteboardType] = [
@@ -25,7 +23,7 @@ public final class ClipboardSync {
     /// Limit for in-band representations (text, images copied from apps).
     public static let maxBytes = 64 << 20
     /// Files per copy (each is one descriptor in a single message).
-    public static let maxFiles = Int(LVNC_MAX_FDS)
+    public static let maxFiles = FileTransfer.maxFiles
 
     private let pasteboard: NSPasteboard
     private let tag: String
@@ -85,7 +83,7 @@ public final class ClipboardSync {
             let started = Date()
             let tops: [URL]
             do {
-                tops = try self.materialize(message)
+                tops = try FileTransfer.materialize(message, under: Self.dropRoot, keep: 4)
             } catch {
                 lvncLog(self.tag, "clipboard from peer: cannot receive files: \(error)")
                 return
@@ -103,53 +101,6 @@ public final class ClipboardSync {
         pasteboard.writeObjects(items)
         lastChange = pasteboard.changeCount
         lastFingerprint = fingerprint
-    }
-
-    /// Recreate the copied files/folders under a fresh drop folder; returns the top-level URLs.
-    private func materialize(_ message: ClipboardMsg) throws -> [URL] {
-        let fm = FileManager.default
-        try fm.createDirectory(at: Self.dropRoot, withIntermediateDirectories: true)
-        // Keep the last few drops (an app may still be reading one), remove older ones.
-        let old = (try? fm.contentsOfDirectory(at: Self.dropRoot, includingPropertiesForKeys: [.creationDateKey])) ?? []
-        let byAge = old.sorted {
-            let a = (try? $0.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-            let b = (try? $1.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? .distantPast
-            return a > b
-        }
-        for url in byAge.dropFirst(4) { try? fm.removeItem(at: url) }
-
-        let drop = Self.dropRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
-        try fm.createDirectory(at: drop, withIntermediateDirectories: true)
-
-        var tops: [URL] = []
-        var topNames: [String: String] = [:] // sender's top-level name -> ours (deduplicated)
-        var usedTops = Set<String>()
-        var fdIndex = 0
-
-        for entry in message.files {
-            var parts = entry.path.split(separator: "/", omittingEmptySubsequences: true).map { Self.sanitize(String($0)) }
-            guard let first = parts.first else { continue }
-            // A top-level entry gets a fresh unique name; its contents (which follow it) reuse it.
-            if parts.count == 1 || topNames[first] == nil {
-                topNames[first] = Self.uniqueName(first, used: &usedTops)
-            }
-            parts[0] = topNames[first]!
-            let url = parts.reduce(drop) { $0.appendingPathComponent($1) }
-            if parts.count == 1 { tops.append(url) }
-
-            if entry.isDirectory {
-                try fm.createDirectory(at: url, withIntermediateDirectories: true)
-                continue
-            }
-            guard fdIndex < message.fds.count else { throw WireError.protocolError("missing descriptor for \(entry.path)") }
-            let fd = message.fds[fdIndex]
-            fdIndex += 1
-            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-            if lvnc_clone_fd_to(fd, url.path) != 0 {
-                throw WireError.io(errno)
-            }
-        }
-        return tops
     }
 
     private func fileItems(_ urls: [URL], extra: [ClipboardMsg.Item]) -> [NSPasteboardItem] {
@@ -192,7 +143,7 @@ public final class ClipboardSync {
         let urls = (pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
 
         if !urls.isEmpty {
-            guard collectFiles(urls, into: &message) else {
+            guard FileTransfer.collect(urls, into: &message, tag: tag) else {
                 message.closeFDs()
                 return
             }
@@ -223,51 +174,6 @@ public final class ClipboardSync {
         send(message)
     }
 
-    /// Open every regular file under the copied URLs. false (with a log line) if nothing should be sent.
-    private func collectFiles(_ urls: [URL], into message: inout ClipboardMsg) -> Bool {
-        func addFile(_ path: String, as relative: String, size: UInt64) -> Bool {
-            guard message.fds.count < Self.maxFiles else {
-                lvncLog(tag, "clipboard: more than \(Self.maxFiles) files, not shared")
-                return false
-            }
-            let fd = open(path, O_RDONLY | O_CLOEXEC)
-            guard fd >= 0 else {
-                lvncLog(tag, "clipboard: cannot open \(relative): \(String(cString: strerror(errno)))")
-                return true // skip just this one
-            }
-            message.fds.append(fd)
-            message.files.append(.init(path: relative, isDirectory: false, size: size))
-            return true
-        }
-
-        for url in urls {
-            let top = url.lastPathComponent
-            var isDir: ObjCBool = false
-            guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { continue }
-
-            if !isDir.boolValue {
-                let attrs = (try? FileManager.default.attributesOfItem(atPath: url.path)) ?? [:]
-                guard addFile(url.path, as: top, size: (attrs[.size] as? UInt64) ?? 0) else { return false }
-                continue
-            }
-
-            message.files.append(.init(path: top, isDirectory: true, size: 0))
-            guard let walker = FileManager.default.enumerator(atPath: url.path) else { continue }
-            while let relative = walker.nextObject() as? String {
-                let attrs = walker.fileAttributes ?? [:]
-                let type = attrs[.type] as? FileAttributeType
-                let path = "\(top)/\(relative)"
-                if type == .typeDirectory {
-                    message.files.append(.init(path: path, isDirectory: true, size: 0))
-                } else if type == .typeRegular {
-                    let size = (attrs[.size] as? UInt64) ?? 0
-                    guard addFile(url.appendingPathComponent(relative).path, as: path, size: size) else { return false }
-                } // symlinks and special files are skipped
-            }
-        }
-        return !message.files.isEmpty
-    }
-
     // MARK: helpers
 
     /// Content identity: representations by bytes, files by path and size.
@@ -292,30 +198,7 @@ public final class ClipboardSync {
             let bytes = message.items.reduce(0) { $0 + $1.data.count }
             parts.append("\(message.items.map(\.type).joined(separator: ", ")) (\(bytes) bytes)")
         }
-        if !message.files.isEmpty {
-            let files = message.files.filter { !$0.isDirectory }
-            let bytes = files.reduce(UInt64(0)) { $0 + $1.size }
-            let folders = message.files.count - files.count
-            parts.append("\(files.count) files" + (folders > 0 ? " in \(folders) folders" : "")
-                + String(format: " (%.1f MB)", Double(bytes) / 1_048_576))
-        }
+        if !message.files.isEmpty { parts.append(FileTransfer.describe(message.files)) }
         return parts.joined(separator: " + ")
-    }
-
-    private static func sanitize(_ name: String) -> String {
-        let cleaned = name.replacingOccurrences(of: ":", with: "_")
-        return cleaned.isEmpty || cleaned == "." || cleaned == ".." ? "file" : cleaned
-    }
-
-    private static func uniqueName(_ name: String, used: inout Set<String>) -> String {
-        var candidate = name
-        var n = 2
-        let base = (name as NSString).deletingPathExtension, ext = (name as NSString).pathExtension
-        while used.contains(candidate.lowercased()) {
-            candidate = ext.isEmpty ? "\(base) \(n)" : "\(base) \(n).\(ext)"
-            n += 1
-        }
-        used.insert(candidate.lowercased())
-        return candidate
     }
 }
